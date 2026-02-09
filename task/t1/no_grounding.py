@@ -54,69 +54,76 @@ class TokenTracker:
             'batch_tokens': self.batch_tokens
         }
 
-#TODO:
-# 1. Create AzureChatOpenAI client
-#    hint: api_version set as empty string if you gen an error that indicated that api_version cannot be None
-# 2. Create TokenTracker
+
+llm_client = AzureChatOpenAI(
+    azure_deployment='gpt-4o',
+    api_key=SecretStr(API_KEY),
+    azure_endpoint=DIAL_URL,
+    api_version=""
+)
+
+token_tracker = TokenTracker()
+
 
 def join_context(context: list[dict[str, Any]]) -> str:
-    #TODO:
-    # You cannot pass raw JSON with user data to LLM (" sign), collect it in just simple string or markdown.
-    # You need to collect it in such way:
-    # User:
-    #   name: John
-    #   surname: Doe
-    #   ...
-    raise NotImplementedError
+    res = ""
+    for user in context:
+        res += f"User:\n"
+        for key, value in user.items():
+            if isinstance(value, dict):
+                res += f"  {key}:\n"
+                for sub_key, sub_value in value.items():
+                    res += f"    {sub_key}: {sub_value}\n"
+            else:
+                res += f"  {key}: {value}\n"
+        res += "\n"
+    return res
 
 
 async def generate_response(system_prompt: str, user_message: str) -> str:
     print("Processing...")
-    #TODO:
-    # 1. Create messages array with system prompt and user message
-    # 2. Generate response (use `ainvoke`, don't forget to `await` the response)
-    # 3. Get usage (hint, usage can be found in response metadata (its dict) and has name 'token_usage', that is also
-    #    dict and there you need to get 'total_tokens')
-    # 4. Add tokens to `token_tracker`
-    # 5. Print response content and `total_tokens`
-    # 5. return response content
-    raise NotImplementedError
+    messages = [
+        SystemMessage(
+            content=system_prompt
+        ),
+        HumanMessage(
+            content=user_message
+        )
+    ]
+    res = await llm_client.ainvoke(messages)
+    total_tokens = res.usage_metadata['total_tokens']
+    content = res.content
+    token_tracker.add_tokens(total_tokens)
+    print(f"LLM Response content: {content}")
+    return content
 
 
 async def main():
     print("Query samples:")
     print(" - Do we have someone with name John that loves traveling?")
-
+    await generate_response("Me is system", "Give me an random advice")
     user_question = input("> ").strip()
     if user_question:
         print("\n--- Searching user database ---")
-
-        #TODO:
-        # 1. Get all users (use UserClient)
-        # 2. Split all users on batches (100 users in 1 batch). We need it since LLMs have its limited context window
-        # 3. Prepare tasks for async run of response generation for users batches:
-        #       - create array tasks
-        #       - iterate through `user_batches` and call `generate_response` with these params:
-        #           - BATCH_SYSTEM_PROMPT (system prompt)
-        #           - User prompt, you need to format USER_PROMPT with context from user batch and user question
-        # 4. Run task asynchronously, use method `gather` form `asyncio`
-        # 5. Filter results on 'NO_MATCHES_FOUND' (see instructions for BATCH_SYSTEM_PROMPT)
-        # 5. If results after filtration are present:
-        #       - combine filtered results with "\n\n" spliterator
-        #       - generate response with such params:
-        #           - FINAL_SYSTEM_PROMPT (system prompt)
-        #           - User prompt: you need to make augmentation of retrieved result and user question
-        # 6. Otherwise prin the info that `No users found matching`
-        # 7. In the end print info about usage, you will be impressed of how many tokens you have used. (imagine if we have 10k or 100k users 😅)
-    raise NotImplementedError
+        users = UserClient().get_all_users()
+        users_batch = [users[i:i+100] for i in range(0, len(users), 100)]
+        tasks = [
+            asyncio.create_task(
+                generate_response(
+                    BATCH_SYSTEM_PROMPT,
+                    USER_PROMPT.format(context=users, query=user_question)
+                )
+            )
+            for users in users_batch]
+        res = await asyncio.gather(*tasks)
+        out = [r for r in res if r != "NO_MATCHES_FOUND"]
+        if not out:
+            print("User not found matching criteria")
+        else:
+            res = await generate_response(FINAL_SYSTEM_PROMPT, USER_PROMPT.format(context="\n\n".join(out), query=user_question))
+            print(res)
+        print(f"Token used: {token_tracker.get_summary()}")
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-# The problems with No Grounding approach are:
-#   - If we load whole users as context in one request to LLM we will hit context window
-#   - Huge token usage == Higher price per request
-#   - Added + one chain in flow where original user data can be changed by LLM (before final generation)
-# User Question -> Get all users -> ‼️parallel search of possible candidates‼️ -> probably changed original context -> final generation
