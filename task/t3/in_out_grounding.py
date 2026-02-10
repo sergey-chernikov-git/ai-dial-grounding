@@ -1,8 +1,10 @@
 import asyncio
+import json
+import time
 from typing import Any, Optional
 
 from langchain_chroma import Chroma
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import SystemMessagePromptTemplate, ChatPromptTemplate
@@ -10,6 +12,134 @@ from langchain_openai import AzureOpenAIEmbeddings, AzureChatOpenAI
 from pydantic import SecretStr, BaseModel, Field
 from task._constants import DIAL_URL, API_KEY
 from task.user_client import UserClient
+
+user_client = UserClient()
+
+embeddings = AzureOpenAIEmbeddings(
+    azure_deployment="text-embedding-3-small-1",
+    azure_endpoint=DIAL_URL,
+    api_key=SecretStr(API_KEY)
+)
+
+llm = AzureChatOpenAI(
+    azure_deployment="gpt-4o",
+    azure_endpoint=DIAL_URL,
+    api_key=SecretStr(API_KEY)
+)
+
+
+class AIHobbySearchResponse(BaseModel):
+    hobbies: dict[str, list[int]] = Field(default_factory=dict, description="Dictionary where keys are hobbies and values are lists of user IDs who mentioned those hobbies in their about_me section")
+
+
+SYSTEM_PROMPT = """
+You are professional assistant for searching users by their hobbies. 
+You have access to the list of users with their `id` and `about_me` section, which contains information about their hobbies. 
+Your task is to analyze the user's query and extract relevant hobbies mentioned in the `about_me` sections of the users.
+As response please use the following format:
+
+## Response Format:
+{format_instructions}
+
+return all ids of users that have mentioned hobby in their `about_me` section.
+"""
+
+USER_PROMPT = """
+#RAG CONTEXT:
+{context}
+
+#USER QUESTION:
+{query}
+"""
+
+tasks = []
+
+def format_user(user):
+    return f"User ID: {user.get('id')}, About Me: {user['about_me']}"
+
+class UserRAG:
+    def __init__(self, embeddings: AzureOpenAIEmbeddings, llm_client: AzureChatOpenAI):
+        self.llm_client = llm_client
+        self.embeddings = embeddings
+        self.vectorstore = None
+
+    async def __aenter__(self):
+        users = user_client.get_all_users()
+        start_time = time.time()
+        print("Creating vectorstore with users' about_me sections...")
+        self.vectorstore = Chroma(collection_name="users", embedding_function=self.embeddings)
+        await self.update_vectorstore(users)
+        end_time = time.time()
+        print(f"Vectorstore created. {end_time - start_time} seconds")
+        return self
+
+    async def retrieve_context(self, query: str, k: int = 100, score: float = 0.1) -> str:
+        docs = self.vectorstore.similarity_search_with_relevance_scores(query=query, k=k, score_threshold=score)
+        context_parts = []
+        for doc in docs:
+            context_parts.append(doc[0].page_content)
+            print(f"Score: {doc[1]}, Content: {doc[0].page_content}")
+        return "\n\n".join(context_parts)
+
+    async def update_vectorstore(self, users: list[dict[str, Any]]):
+        batch_users = [user_batch for user_batch in [users[i:i + 100] for i in range(0, len(users), 100)]]
+        tasks = []
+        for batch in batch_users:
+            tasks.append(self.vectorstore.aadd_documents(
+                documents=[Document(id=user.get('id'), page_content=format_user(user)) for user in batch]
+            ))
+        await asyncio.gather(*tasks)
+
+
+    def augment_prompt(self, query: str, context: str) -> str:
+        return USER_PROMPT.format(query=query, context=context)
+
+    def generate_answer(self, augmented_prompt: str) -> str:
+        # messages = [
+        #     SystemMessage(SYSTEM_PROMPT),
+        #     HumanMessage(augmented_prompt)
+        # ]
+        # parser = PydanticOutputParser(pydantic_object=AIHobbySearchResponse)
+        # prompt = ChatPromptTemplate.from_messages(messages)
+        # chain = self.llm_client | prompt
+        # response = self.llm_client.invoke(messages)
+
+        messages = [
+            SystemMessagePromptTemplate.from_template(template=SYSTEM_PROMPT),
+            HumanMessage(content=augmented_prompt)
+        ]
+        parser = PydanticOutputParser(pydantic_object=AIHobbySearchResponse)
+        prompt = ChatPromptTemplate.from_messages(messages).partial(
+            format_instructions=parser.get_format_instructions())
+        response = (prompt | self.llm_client | parser).invoke({})
+        return response.hobbies
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+async def main():
+    # task = asyncio.create_task(user_retrieval())
+    while True:
+
+        print("== Hobbies Searching Wizard ==")
+        print("Hello and welcome to Hobbies Searching Wizard! Please enter your request:")
+
+        user_input = input("> ")
+        hobbies = []
+        async with UserRAG(embeddings, llm) as user_rag:
+            context = await user_rag.retrieve_context(user_input)
+            augmented_prompt = user_rag.augment_prompt(user_input, context)
+            hobbies = user_rag.generate_answer(augmented_prompt)
+
+        for hobby in hobbies:
+            print(f"Hobby: {hobby}")
+            print("Users:")
+            for user_id in hobbies[hobby]:
+                user_info = await user_client.get_user(int(user_id))
+                print(json.dumps(user_info, indent=2))
+
+
+asyncio.run(main())
 
 #TODO: Info about app:
 # HOBBIES SEARCHING WIZARD
@@ -52,6 +182,3 @@ from task.user_client import UserClient
 # TASK:
 # Implement such application as described on the `flow.png` with adaptive vector based grounding and 'lite' version of
 # output grounding (verification that such user exist and fetch full user info)
-
-
-
